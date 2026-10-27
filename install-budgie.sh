@@ -36,6 +36,6 @@ disown || true
 echo "Installed ${binary}"
 echo "Daemon autostarts from ${autostart_file}"
 echo
-echo "Bind Alt+tilde (the key above Tab) in Budgie Desktop Settings → Keyboard → Custom shortcuts:"
-echo "  ${binary} show --next --modifiers-held alt"
-echo "  ${binary} show --previous --modifiers-held alt,shift"
+echo "Bind Super+tilde (the key above Tab) in Budgie Desktop Settings → Keyboard → Custom shortcuts:"
+echo "  ${binary} show --next --modifiers-held super"
+echo "  ${binary} show --previous --modifiers-held super,shift"
