@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, bail};
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
@@ -10,7 +10,7 @@ use smithay_client_toolkit::{
     reexports::{
         client::{
             self, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
-            globals::registry_queue_init,
+            globals::{GlobalList, registry_queue_init},
             protocol::{
                 wl_keyboard::WlKeyboard,
                 wl_output::{Transform, WlOutput},
@@ -144,7 +144,7 @@ pub struct RawHandles {
 unsafe impl Send for RawHandles {}
 
 impl WaylandClient {
-    pub fn init(labwc_backend: bool) -> anyhow::Result<(
+    pub fn init(toplevel_capture: bool) -> anyhow::Result<(
         Self,
         EventQueue<Self>,
         UnboundedReceiver<WaylandClientEvent>,
@@ -159,14 +159,18 @@ impl WaylandClient {
 
         let seat_state = SeatState::new(&globals, &qh);
 
+        if toplevel_capture && !has_toplevel_capture_globals(&globals) {
+            bail!("no geometry provider");
+        }
+
         // Bind the foreign toplevel manager
         let _toplevel_manager =
             globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 3..=3, ())?;
 
-        // Region capture needs wlr-screencopy. Labwc captures each toplevel
-        // directly and must not require that global.
-        let (screencopy_manager, labwc) = if labwc_backend {
-            info!("using labwc per-window capture");
+        // Region capture needs wlr-screencopy. Per-window capture binds each
+        // toplevel directly and must not require that global.
+        let (screencopy_manager, labwc) = if toplevel_capture {
+            info!("using per-window capture");
             (None, Some(labwc_capture::LabwcCapture::bind(&globals, &qh)?))
         } else {
             let screencopy_manager =
@@ -207,7 +211,25 @@ impl WaylandClient {
 
         Ok((wayland_app, event_queue, wl_rx))
     }
+}
 
+fn has_toplevel_capture_globals(globals: &GlobalList) -> bool {
+    const REQUIRED: &[(&str, u32)] = &[
+        ("ext_foreign_toplevel_list_v1", 1),
+        ("ext_foreign_toplevel_image_capture_source_manager_v1", 1),
+        ("ext_image_copy_capture_manager_v1", 1),
+        ("zwlr_foreign_toplevel_manager_v1", 3),
+    ];
+
+    globals.contents().with_list(|list| {
+        REQUIRED.iter().all(|(interface, min_version)| {
+            list.iter()
+                .any(|global| global.interface == *interface && global.version >= *min_version)
+        })
+    })
+}
+
+impl WaylandClient {
     pub fn get_modifiers(&self) -> &Modifiers {
         &self.modifiers
     }

@@ -18,7 +18,7 @@ pub enum GeometryWorkerEvent<U: Copy + Send + 'static> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompositorBackend {
     Region,
-    Labwc,
+    ToplevelCapture,
 }
 
 #[derive(Debug)]
@@ -30,7 +30,8 @@ pub struct GeometryWorker<U: Copy + Send + 'static> {
 
 impl<U: Copy + Send + 'static> GeometryWorker<U> {
     pub fn new() -> Result<Self> {
-        // Hyprland, then Sway. Labwc is selected only when neither socket exists.
+        // Hyprland, then Sway. Otherwise the Wayland client selects per-window
+        // capture only if the compositor advertises the required globals.
         let mut provider: Option<Box<dyn GeometryProvider + Send>> =
             if let Ok(ipc) = HyprlandIpc::new() {
                 Some(Box::new(ipc))
@@ -42,7 +43,7 @@ impl<U: Copy + Send + 'static> GeometryWorker<U> {
         let backend = if provider.is_some() {
             CompositorBackend::Region
         } else {
-            CompositorBackend::Labwc
+            CompositorBackend::ToplevelCapture
         };
 
         let (request_tx, mut request_rx) = mpsc::unbounded_channel();

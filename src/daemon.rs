@@ -59,7 +59,7 @@ impl Daemon {
         let geometry_worker = GeometryWorker::new()?;
 
         let (wayland_client, wayland_client_q, wayland_client_rx) =
-            WaylandClient::init(geometry_worker.backend() == CompositorBackend::Labwc)?;
+            WaylandClient::init(geometry_worker.backend() == CompositorBackend::ToplevelCapture)?;
 
         let (renderer_tx, renderer_rx) = mpsc::unbounded_channel();
 
@@ -193,10 +193,10 @@ impl Daemon {
                 }
                 Some((id, preview_image)) = self.preview_resizer.recv() => {
                     // Region capture only updates while hidden so the open switcher
-                    // does not jump. Labwc captures every window, including ones
-                    // that finish after the switcher is already open.
+                    // does not jump. Per-window capture includes windows that
+                    // finish after the switcher is already open.
                     let apply = !self.visible
-                        || self.geometry_worker.backend() == CompositorBackend::Labwc;
+                        || self.geometry_worker.backend() == CompositorBackend::ToplevelCapture;
                     if apply {
                         self.gui.update_item_preview(id, preview_image.buffer(), preview_image.width());
                         if self.visible {
@@ -267,7 +267,7 @@ impl Daemon {
 
                     let Some(active_window_id) = self.get_active_window_id() else { continue };
 
-                    if self.geometry_worker.backend() == CompositorBackend::Labwc {
+                    if self.geometry_worker.backend() == CompositorBackend::ToplevelCapture {
                         let qh = self.wayland_client_q.handle();
                         self.wayland_client.capture_missing_toplevels(&qh)?;
                         self.wayland_client
