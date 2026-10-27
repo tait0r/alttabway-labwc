@@ -10,7 +10,7 @@ use tracing::{debug, trace};
 
 use crate::{
     config_worker::{ConfigEvent, ConfigHandle, RenderBackend},
-    geometry_worker::{GeometryWorker, GeometryWorkerEvent},
+    geometry_worker::{CompositorBackend, GeometryWorker, GeometryWorkerEvent},
     gui::{Gui, GuiEvent},
     image_resizer::ImageResizer,
     ipc::{AlttabwayIpc, Direction, IpcCommand, Modifier},
@@ -58,7 +58,8 @@ impl Daemon {
         let config_handle = ConfigHandle::new();
         let geometry_worker = GeometryWorker::new()?;
 
-        let (wayland_client, wayland_client_q, wayland_client_rx) = WaylandClient::init()?;
+        let (wayland_client, wayland_client_q, wayland_client_rx) =
+            WaylandClient::init(geometry_worker.backend() == CompositorBackend::Labwc)?;
 
         let (renderer_tx, renderer_rx) = mpsc::unbounded_channel();
 
@@ -191,8 +192,23 @@ impl Daemon {
                     self.paint()?
                 }
                 Some((id, preview_image)) = self.preview_resizer.recv() => {
-                    if !self.visible {
+                    // Region capture only updates while hidden so the open switcher
+                    // does not jump. Labwc captures every window, including ones
+                    // that finish after the switcher is already open.
+                    let apply = !self.visible
+                        || self.geometry_worker.backend() == CompositorBackend::Labwc;
+                    if apply {
                         self.gui.update_item_preview(id, preview_image.buffer(), preview_image.width());
+                        if self.visible {
+                            let (width, height) = self.gui.get_window_dimensions();
+                            if width != self.width || height != self.height {
+                                self.width = width;
+                                self.height = height;
+                                self.wayland_client.resize_surfaces(width, height);
+                            } else {
+                                self.request_repaint()?;
+                            }
+                        }
                     }
                 }
                 result = self.geometry_worker.recv() => {
@@ -251,7 +267,15 @@ impl Daemon {
 
                     let Some(active_window_id) = self.get_active_window_id() else { continue };
 
-                    self.geometry_worker.request_active_window_geometry(active_window_id)?;
+                    if self.geometry_worker.backend() == CompositorBackend::Labwc {
+                        let qh = self.wayland_client_q.handle();
+                        self.wayland_client.capture_missing_toplevels(&qh)?;
+                        self.wayland_client
+                            .capture_toplevel(active_window_id, &qh)?;
+                    } else {
+                        self.geometry_worker
+                            .request_active_window_geometry(active_window_id)?;
+                    }
                 }
                 Some(event) = self.gui.recv() => {
                     match event {

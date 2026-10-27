@@ -54,7 +54,10 @@ use smithay_client_toolkit::{
 };
 use std::{collections::HashMap, ffi::c_void, ptr::NonNull};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+mod labwc_capture;
+mod window_match;
 
 use crate::wayland_client_event::WaylandClientEvent;
 
@@ -123,8 +126,9 @@ pub struct WaylandClient {
     toplevel_windows: Vec<ZwlrForeignToplevelHandleV1>,
     pool: SlotPool,
 
-    screencopy_manager: ZwlrScreencopyManagerV1,
+    screencopy_manager: Option<ZwlrScreencopyManagerV1>,
     screencopy_frames: HashMap<ZwlrScreencopyFrameV1, ScreencopyFrameState>,
+    labwc: Option<labwc_capture::LabwcCapture>,
 
     themed_pointer: Option<ThemedPointer>,
     current_cursor: Option<CursorIcon>,
@@ -140,7 +144,7 @@ pub struct RawHandles {
 unsafe impl Send for RawHandles {}
 
 impl WaylandClient {
-    pub fn init() -> anyhow::Result<(
+    pub fn init(labwc_backend: bool) -> anyhow::Result<(
         Self,
         EventQueue<Self>,
         UnboundedReceiver<WaylandClientEvent>,
@@ -159,8 +163,16 @@ impl WaylandClient {
         let _toplevel_manager =
             globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 3..=3, ())?;
 
-        // Bind screencopy manager
-        let screencopy_manager = globals.bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 1..=3, ())?;
+        // Region capture needs wlr-screencopy. Labwc captures each toplevel
+        // directly and must not require that global.
+        let (screencopy_manager, labwc) = if labwc_backend {
+            info!("using labwc per-window capture");
+            (None, Some(labwc_capture::LabwcCapture::bind(&globals, &qh)?))
+        } else {
+            let screencopy_manager =
+                globals.bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 1..=3, ())?;
+            (Some(screencopy_manager), None)
+        };
 
         // Bind shared memory
         let shm = Shm::bind(&globals, &qh)?;
@@ -184,6 +196,7 @@ impl WaylandClient {
             toplevel_windows: Vec::new(),
             screencopy_manager,
             screencopy_frames: HashMap::new(),
+            labwc,
             pool,
 
             themed_pointer: None,
@@ -251,6 +264,14 @@ impl WaylandClient {
         self.surfaces = Some(surfaces);
 
         Ok(())
+    }
+
+    pub fn resize_surfaces(&mut self, width: u32, height: u32) {
+        let Some(surfaces) = &self.surfaces else {
+            return;
+        };
+        surfaces.layer_surface.set_size(width, height);
+        surfaces.layer_surface.commit();
     }
 
     pub fn create_buffer(&mut self, width: i32, height: i32) -> anyhow::Result<Buffer> {
@@ -378,7 +399,11 @@ impl WaylandClient {
             return Ok(());
         };
 
-        let frame = self.screencopy_manager.capture_output_region(
+        let Some(screencopy_manager) = &self.screencopy_manager else {
+            return Ok(());
+        };
+
+        let frame = screencopy_manager.capture_output_region(
             0,
             &output,
             relative_x,
@@ -802,15 +827,16 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for WaylandClient {
 
         match event {
             Event::Toplevel { toplevel } => {
+                let id = toplevel.id().protocol_id();
                 state
                     .wl_tx
-                    .send(WaylandClientEvent::TopLevelAdded(
-                        toplevel.id().protocol_id(),
-                    ))
+                    .send(WaylandClientEvent::TopLevelAdded(id))
                     .unwrap();
                 state.toplevel_windows.push(toplevel);
+                state.track_zwlr_window(id);
             }
             Event::Finished => {
+                state.clear_zwlr_windows();
                 state.toplevel_windows.clear();
             }
             _ => unimplemented!(),
@@ -830,16 +856,25 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandClient {
         event: zwlr_foreign_toplevel_handle_v1::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         use zwlr_foreign_toplevel_handle_v1::Event;
 
         let id = handle.id().protocol_id();
 
         let client_event = match event {
-            Event::Title { title } => WaylandClientEvent::TopLevelTitleUpdate(id, title).into(),
-            Event::AppId { app_id } => WaylandClientEvent::TopLevelAppIdUpdate(id, app_id).into(),
-            Event::Closed => WaylandClientEvent::TopLevelRemoved(id).into(),
+            Event::Title { title } => {
+                state.set_zwlr_title(id, &title);
+                WaylandClientEvent::TopLevelTitleUpdate(id, title).into()
+            }
+            Event::AppId { app_id } => {
+                state.set_zwlr_app_id(id, &app_id);
+                WaylandClientEvent::TopLevelAppIdUpdate(id, app_id).into()
+            }
+            Event::Closed => {
+                state.remove_zwlr_window(id);
+                WaylandClientEvent::TopLevelRemoved(id).into()
+            }
             Event::State {
                 state: window_state,
             } => {
@@ -853,7 +888,11 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandClient {
             }
 
             // this set of events have all been processed
-            Event::Done => None,
+            Event::Done => {
+                state.commit_zwlr_window(id);
+                let _ = state.capture_missing_toplevels(qh);
+                None
+            }
 
             // windows have changed monitors
             Event::OutputEnter { .. } => None,

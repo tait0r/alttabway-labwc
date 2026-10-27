@@ -15,20 +15,34 @@ pub enum GeometryWorkerEvent<U: Copy + Send + 'static> {
     ActiveWindow(U, Geometry),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompositorBackend {
+    Region,
+    Labwc,
+}
+
 #[derive(Debug)]
 pub struct GeometryWorker<U: Copy + Send + 'static> {
     request_tx: UnboundedSender<GeometryWorkerRequestEvent<U>>,
     response_rx: UnboundedReceiver<GeometryWorkerEvent<U>>,
+    backend: CompositorBackend,
 }
 
 impl<U: Copy + Send + 'static> GeometryWorker<U> {
     pub fn new() -> Result<Self> {
-        let mut provider: Box<dyn GeometryProvider + Send> = if let Ok(ipc) = HyprlandIpc::new() {
-            Box::new(ipc)
-        } else if let Ok(ipc) = SwayIpc::new() {
-            Box::new(ipc)
+        // Hyprland, then Sway. Labwc is selected only when neither socket exists.
+        let mut provider: Option<Box<dyn GeometryProvider + Send>> =
+            if let Ok(ipc) = HyprlandIpc::new() {
+                Some(Box::new(ipc))
+            } else if let Ok(ipc) = SwayIpc::new() {
+                Some(Box::new(ipc))
+            } else {
+                None
+            };
+        let backend = if provider.is_some() {
+            CompositorBackend::Region
         } else {
-            bail!("no geometry provider");
+            CompositorBackend::Labwc
         };
 
         let (request_tx, mut request_rx) = mpsc::unbounded_channel();
@@ -38,6 +52,9 @@ impl<U: Copy + Send + 'static> GeometryWorker<U> {
             while let Some(event) = request_rx.recv().await {
                 match event {
                     GeometryWorkerRequestEvent::ActiveWindow(user_data) => {
+                        let Some(provider) = provider.as_mut() else {
+                            continue;
+                        };
                         if let Ok(geometry) = provider.get_active_window_geometry()
                             && response_tx
                                 .send(GeometryWorkerEvent::ActiveWindow(user_data, geometry))
@@ -53,7 +70,12 @@ impl<U: Copy + Send + 'static> GeometryWorker<U> {
         Ok(Self {
             request_tx,
             response_rx,
+            backend,
         })
+    }
+
+    pub fn backend(&self) -> CompositorBackend {
+        self.backend
     }
 
     pub fn request_active_window_geometry(&mut self, user_data: U) -> Result<()> {
